@@ -286,8 +286,21 @@ def test_resolve_fail() -> None:
         Package('six == 1.15.0', constraint=True),
     ]
     with pytest.raises(install_pinned.ResolutionError) as exc_info:
-        install_pinned.resolve(items)
+        install_pinned.resolve(items, fail_fast=False)
     assert set(exc_info.value.errors) == {
         'No version pinned for netifaces',
         'No version pinned for numpy'
     }
+
+
+@pytest.mark.internet
+def test_resolve_fail_fast() -> None:
+    items: List[Union[Package, str]] = [
+        Package('katsdptelstate == 0.10'),
+        Package('redis == 3.5.3', constraint=True),
+        Package('msgpack == 1.0.1', constraint=True),
+        Package('six == 1.15.0', constraint=True),
+    ]
+    with pytest.raises(install_pinned.ResolutionError) as exc_info:
+        install_pinned.resolve(items, fail_fast=True)
+    assert exc_info.value.errors == ['No version pinned for netifaces']

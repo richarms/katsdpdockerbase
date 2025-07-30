@@ -6,9 +6,11 @@ by explicitly installing a particular version or specifying a constraint for
 it. However, VCS URLs are not required to use a tag/commit: any URL is valid.
 
 Additionally, a new type of constraint file can be used by specifying
-``--default-versions`` instead of `--constraint``: these are weaker than normal
-constraints, in that they specify a default version but a normal requirement
-or constraint can override it by specifying a different exact version.
+``--default-versions`` instead of ``--constraint``: these are weaker than
+normal constraints, in that they specify a default version but a normal
+requirement or constraint can override it by specifying a different exact
+version. The tool can also run in dry-run or verbose modes and optionally
+fail fast on the first missing version.
 
 It passes some additional arguments to ``pip`` to make it more suitable for use
 in CI/CD pipelines.
@@ -230,14 +232,24 @@ def evaluate_marker(requirement: Requirement, extras: Iterable[str]) -> bool:
     """
     if requirement.marker is None:
         return True
-    try:
-        return requirement.marker.evaluate()
-    except UndefinedEnvironmentName:
+    marker = requirement.marker
+    if marker is None:
+        return True
+    # packaging 23+ no longer raises UndefinedEnvironmentName when evaluating
+    # markers that reference unknown variables such as ``extra``. Detect use
+    # of ``extra`` explicitly and handle it ourselves.
+    if 'extra' in str(marker):
         extras = set(extras) or {''}
         for extra in extras:
-            if requirement.marker.evaluate({'extra': extra}):
-                return True
+            try:
+                if marker.evaluate({'extra': extra}):
+                    return True
+            except UndefinedEnvironmentName:
+                # Fall back to evaluation without ``extra`` if packaging<23
+                pass
         return False
+    else:
+        return marker.evaluate()
 
 
 def get_dependencies(requirement: Requirement) -> Sequence[Requirement]:
@@ -246,8 +258,12 @@ def get_dependencies(requirement: Requirement) -> Sequence[Requirement]:
         req = PipRequirement(str(requirement))
         ireq = InstallRequirement(req, None)
         pypi = piptools.repositories.PyPIRepository([], cache_dir)
-        # Map from InstallRequirement back to packaging Requirement
-        deps = [Requirement(str(r.req)) for r in pypi.get_dependencies(ireq)]
+        # ``get_dependencies`` returns ``InstallationCandidate`` objects in
+        # newer pip-tools. Convert these to packaging ``Requirement`` objects.
+        deps = [
+            Requirement(f"{r.name}=={r.version}")
+            for r in pypi.get_dependencies(ireq)
+        ]
         # Note: ireq.extras is normalised, unlike req.extras
         deps = [dep for dep in deps if evaluate_marker(dep, ireq.extras)]
         for dep in deps:
@@ -258,7 +274,7 @@ def get_dependencies(requirement: Requirement) -> Sequence[Requirement]:
         return deps
 
 
-def resolve(items: Iterable[Union[Package, str]]) -> Sequence[Union[Requirement, str]]:
+def resolve(items: Iterable[Union[Package, str]], *, fail_fast: bool = False) -> Sequence[Union[Requirement, str]]:
     def add_constraint(pkg: Package):
         name = pkg.requirement.name
         if name in constraints:
@@ -301,6 +317,8 @@ def resolve(items: Iterable[Union[Package, str]]) -> Sequence[Union[Requirement,
             install[req.name] = req
             q.extend(get_dependencies(req))
         except ValueError as exc:
+            if fail_fast:
+                raise ResolutionError([str(exc)])
             errors.append(str(exc))
 
     if errors:
@@ -323,9 +341,10 @@ def collect_arguments(args: argparse.Namespace) -> Sequence[Union[Package, str]]
     return reqs
 
 
-def run_pip(args: List[str], dry_run: bool) -> None:
-    if dry_run:
+def run_pip(args: List[str], dry_run: bool, verbose: bool) -> None:
+    if dry_run or verbose:
         print('pip {}'.format(' '.join(args)))
+    if dry_run:
         if args != ['check']:
             print('Contents of {}:'.format(args[-1]))
             with open(args[-1]) as f:
@@ -351,13 +370,19 @@ def main() -> int:
         '--dry-run', '-n', action='store_true',
         help='Just report what would be done')
     parser.add_argument(
+        '--verbose', '-v', action='store_true',
+        help='Show commands that are executed')
+    parser.add_argument(
+        '--fail-fast', action='store_true',
+        help='Stop immediately if a version is missing')
+    parser.add_argument(
         'package', type=parse_requirement, nargs='*',
         help='Extra requirements')
     args, extra_args = parser.parse_known_args()
 
     explicit_reqs = collect_arguments(args)
     try:
-        reqs = resolve(explicit_reqs)
+        reqs = resolve(explicit_reqs, fail_fast=args.fail_fast)
     except ResolutionError as exc:
         for error in exc.errors:
             print(error, file=sys.stderr)
@@ -369,9 +394,10 @@ def main() -> int:
         req_file.flush()
         run_pip(['install',
                  '--retries', '10', '--timeout', '30',
-                 '--no-deps'] + extra_args + ['-r', req_file.name], args.dry_run)
+                 '--no-deps'] + extra_args + ['-r', req_file.name],
+                args.dry_run, args.verbose)
     # Check that all dependencies were found
-    run_pip(['check'], args.dry_run)
+    run_pip(['check'], args.dry_run, args.verbose)
     return 0
 
 
