@@ -230,8 +230,6 @@ def evaluate_marker(requirement: Requirement, extras: Iterable[str]) -> bool:
     is used in wheels to reference the extras being installed for the
     depending package (see PEP 508).
     """
-    if requirement.marker is None:
-        return True
     marker = requirement.marker
     if marker is None:
         return True
